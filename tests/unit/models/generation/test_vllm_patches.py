@@ -33,11 +33,13 @@ The two port patches ship their own suites. These cover the remaining patches:
 import ast
 import logging
 import os
+import textwrap
 
 import pytest
 
 from nemo_rl.models.generation.vllm import patches
 from tests.unit.models.generation.vllm_patch_source_utils import (
+    patch_snippets,
     write_unpatched_copy,
 )
 
@@ -50,6 +52,9 @@ _RADIO_MARKER = "initializer_factor = self.config.initializer_factor"
 _GLM_DSA_SOURCE = "model_executor/models/deepseek_v2.py"
 _GLM_DSA_PATCH_FN = "_patch_vllm_glm_decoder_sequence_parallel_moe"
 _GLM_DSA_MARKER = 'getattr(config, "model_type", None) != "glm_moe_dsa"'
+_ROUTED_EXPERTS_SOURCE = "model_executor/layers/fused_moe/routed_experts.py"
+_SHARD_DIM_PATCH_FN = "_patch_vllm_routed_experts_shard_dim"
+_SHARD_DIM_MARKER = "shard_dim += max(expert_data.ndim - 2, 0)"
 
 
 @pytest.fixture
@@ -78,6 +83,17 @@ def patched_glm_dsa_source(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
     patches._patch_vllm_glm_decoder_sequence_parallel_moe(logging.getLogger(__name__))
+    return copied
+
+
+@pytest.fixture
+def patched_routed_experts_source(tmp_path, monkeypatch):
+    """The installed RoutedExperts source, unpatched then patched in tmp."""
+    copied = write_unpatched_copy(
+        _ROUTED_EXPERTS_SOURCE, _SHARD_DIM_PATCH_FN, tmp_path / "routed_experts.py"
+    )
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
+    patches._patch_vllm_routed_experts_shard_dim(logging.getLogger(__name__))
     return copied
 
 
@@ -210,6 +226,94 @@ def test_glm_decoder_sp_moe_patch_warns_on_unknown_source(
 
     assert model_source.read_text() == "class DeepseekV2DecoderLayer:\n    pass\n"
     assert "vLLM 0.25.1 source shape was not found" in caplog.text
+
+
+@pytest.mark.vllm
+def test_routed_experts_shard_dim_patch_anchor_still_matches_installed_vllm(
+    patched_routed_experts_source,
+):
+    """Pin the vLLM 0.25.1 RoutedExperts weight_loader shape being patched."""
+    content = patched_routed_experts_source.read_text()
+    assert _SHARD_DIM_MARKER in content
+    ast.parse(content)  # the edit must leave valid Python
+
+
+@pytest.mark.vllm
+def test_routed_experts_shard_dim_patch_is_idempotent(
+    patched_routed_experts_source, monkeypatch
+):
+    """Every worker on a node runs the patch against the same file."""
+    before = patched_routed_experts_source.read_text()
+    monkeypatch.setattr(
+        patches, "_get_vllm_file", lambda _relative: str(patched_routed_experts_source)
+    )
+
+    patches._patch_vllm_routed_experts_shard_dim(logging.getLogger(__name__))
+
+    assert patched_routed_experts_source.read_text() == before
+
+
+def test_routed_experts_shard_dim_patch_warns_on_unknown_source(
+    monkeypatch, tmp_path, caplog
+):
+    experts_source = tmp_path / "routed_experts.py"
+    experts_source.write_text("class RoutedExperts:\n    pass\n")
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(experts_source))
+
+    with caplog.at_level(logging.WARNING):
+        patches._patch_vllm_routed_experts_shard_dim(logging.getLogger(__name__))
+
+    assert experts_source.read_text() == "class RoutedExperts:\n    pass\n"
+    assert "expected snippet not found" in caplog.text
+
+
+def _shard_dim_outcome(torch, snippet: str, loaded_weight, expert_id) -> bool:
+    """Execute a patch snippet; return True iff shard_dim lands on a data axis.
+
+    Replays the snippet's own ``shard_dim`` arithmetic against a fused 3D
+    expert param (``[E, I, H]``), then applies ``RoutedExperts._get_hidden_dim``'s
+    validity rule: for an ``ndim`` destination the data axes are the last two,
+    so ``shard_dim`` must be ``ndim - 2`` or ``ndim - 1``.
+    """
+
+    class _Param:
+        data = torch.zeros(4, 8, 16)  # [E, I, H], the grouped expert param
+
+    namespace = {
+        "loaded_weight": loaded_weight,
+        "param": _Param(),
+        "expert_id": expert_id,
+        "shard_dim": 0,  # w1/w3 convention before the offset
+    }
+    exec(textwrap.dedent(snippet), namespace)
+    shard_dim = namespace["shard_dim"]
+    ndim = namespace["expert_data"].ndim
+    return shard_dim in (ndim - 2, ndim - 1)
+
+
+@pytest.mark.vllm
+def test_routed_experts_shard_dim_patch_moves_off_the_expert_axis():
+    """Pin the shard_dim arithmetic the patch corrects, in all three call shapes.
+
+    The 2D-per-expert and 3D-full-load cases are the pre-patch behavior that
+    must not change; the 2D-against-3D case is the in-memory refit regression
+    (``_get_hidden_dim`` raises ``shard_dim=0 is not a valid data dimension
+    for a 3D tensor``) the patch exists to fix.
+    """
+    torch = pytest.importorskip("torch")
+    old_snippet, new_snippet = patch_snippets(_SHARD_DIM_PATCH_FN)
+
+    # 2D per-expert load into one expert slice: valid before and after.
+    for snippet in (old_snippet, new_snippet):
+        assert _shard_dim_outcome(torch, snippet, torch.zeros(8, 16), 0)
+    # 3D full-extent load: valid before and after.
+    for snippet in (old_snippet, new_snippet):
+        assert _shard_dim_outcome(torch, snippet, torch.zeros(4, 8, 16), None)
+    # 2D shard against a 3D destination (multi-expert selection during in-memory
+    # refit): invalid before (shard_dim stays on the expert axis), fixed after.
+    assert not _shard_dim_outcome(torch, old_snippet, torch.zeros(8, 16), [0])
+    assert _shard_dim_outcome(torch, new_snippet, torch.zeros(8, 16), [0])
+
 
 
 @pytest.mark.parametrize(

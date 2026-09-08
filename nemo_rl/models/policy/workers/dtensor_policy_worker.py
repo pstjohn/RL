@@ -65,7 +65,7 @@ from nemo_rl.distributed.model_utils import (
     distributed_vocab_topk,
     get_logprobs_from_vocab_parallel_logits,
 )
-from nemo_rl.models.automodel.data import filter_multimodal_kwargs_for_model
+from nemo_rl.models.automodel.data import materialize_multimodal_data_for_model
 from nemo_rl.models.dtensor.parallelize import (
     _parallelize_model,
     clip_grad_by_total_norm_,
@@ -781,11 +781,10 @@ class DTensorPolicyWorkerImpl(
                             flash_attn_kwargs = {}
 
                         # add vlm kwargs to model call
-                        vlm_kwargs = mb.get_multimodal_dict(
-                            as_tensors=True, device=input_ids.device
-                        )
-                        vlm_kwargs = filter_multimodal_kwargs_for_model(
-                            self.model, vlm_kwargs
+                        vlm_kwargs = materialize_multimodal_data_for_model(
+                            self.model,
+                            mb.get_multimodal_dict(as_tensors=False),
+                            input_ids=input_ids,
                         )
                         if len(vlm_kwargs) > 0:
                             position_ids = None
@@ -1089,10 +1088,11 @@ class DTensorPolicyWorkerImpl(
                 step += 1
                 input_ids = lp_batch.get("input_ids").cuda()
                 input_lengths = lp_batch.get("input_lengths")
-                vlm_kwargs = lp_batch.get_multimodal_dict(
-                    as_tensors=True, device=input_ids.device
+                vlm_kwargs = materialize_multimodal_data_for_model(
+                    self.model,
+                    lp_batch.get_multimodal_dict(as_tensors=False),
+                    input_ids=input_ids,
                 )
-                vlm_kwargs = filter_multimodal_kwargs_for_model(self.model, vlm_kwargs)
 
                 batch_size, seq_len = input_ids.shape
                 if self.enable_seq_packing:
@@ -1534,10 +1534,11 @@ class DTensorPolicyWorkerImpl(
             ):
                 input_ids = lp_batch.get("input_ids").cuda()
                 input_lengths = lp_batch.get("input_lengths")
-                vlm_kwargs = lp_batch.get_multimodal_dict(
-                    as_tensors=True, device=input_ids.device
+                vlm_kwargs = materialize_multimodal_data_for_model(
+                    self.model,
+                    lp_batch.get_multimodal_dict(as_tensors=False),
+                    input_ids=input_ids,
                 )
-                vlm_kwargs = filter_multimodal_kwargs_for_model(self.model, vlm_kwargs)
                 batch_size, seq_len = input_ids.shape
 
                 # Store original shapes for unpacking later

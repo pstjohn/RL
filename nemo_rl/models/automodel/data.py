@@ -18,13 +18,14 @@ import inspect
 import itertools
 from dataclasses import dataclass, field
 from functools import cache
-from typing import Any, Iterable, Iterator, Optional, Tuple
+from typing import Any, Iterable, Iterator, Optional, Protocol, Tuple, runtime_checkable
 
 import torch
 from torch import nn
 from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.huggingface.common import (
     get_flash_attention_kwargs,
@@ -84,6 +85,87 @@ def filter_multimodal_kwargs_for_model(
     return {
         key: value for key, value in multimodal_kwargs.items() if key in accepted_kwargs
     }
+
+
+@runtime_checkable
+class MultimodalDataMaterializer(Protocol):
+    """Optional model interface for jointly materializing logical media rows."""
+
+    def materialize_multimodal_data(
+        self,
+        multimodal_data: dict[str, Any],
+        *,
+        input_ids: torch.Tensor,
+    ) -> dict[str, Any]:
+        """Return materialized model-forward kwargs for one policy microbatch."""
+        ...
+
+
+def materialize_multimodal_data_for_model(
+    model: nn.Module,
+    multimodal_data: dict[str, Any],
+    *,
+    input_ids: torch.Tensor,
+) -> dict[str, Any]:
+    """Materialize logical multimodal rows for an AutoModel forward.
+
+    Model classes may define the public hook below to jointly merge a payload::
+
+        def materialize_multimodal_data(
+            self,
+            multimodal_data: dict[str, Any],
+            *,
+            input_ids: torch.Tensor,
+        ) -> dict[str, Any]:
+            ...
+
+    ``multimodal_data`` contains unmaterialized :class:`PackedTensor` values,
+    preserving their logical rows. ``input_ids`` is the exact policy
+    microbatch passed to the model, so the hook can flatten variable-length
+    feature rows and rebase row-local projector indices against its padded
+    sequence length. The hook must return model-forward kwargs with every
+    ``PackedTensor`` materialized and placed on the required device.
+
+    Models without the hook retain the standard independent ``PackedTensor``
+    concatenation behavior.
+    """
+    if not multimodal_data:
+        return {}
+
+    if not isinstance(model, MultimodalDataMaterializer):
+        # Preserve BatchedDataDict's coupled-media validation in the default
+        # path. Non-PackedTensor entries are already materialized optional
+        # processor kwargs and pass through unchanged.
+        materialized = {
+            key: value
+            for key, value in multimodal_data.items()
+            if not isinstance(value, PackedTensor)
+        }
+        materialized.update(
+            BatchedDataDict(multimodal_data).get_multimodal_dict(
+                as_tensors=True, device=input_ids.device
+            )
+        )
+    else:
+        materialized = model.materialize_multimodal_data(
+            dict(multimodal_data),
+            input_ids=input_ids,
+        )
+        if not isinstance(materialized, dict):
+            raise TypeError(
+                "materialize_multimodal_data must return a dict of model-forward "
+                f"kwargs, got {type(materialized).__name__}"
+            )
+
+    unmaterialized = [
+        key for key, value in materialized.items() if isinstance(value, PackedTensor)
+    ]
+    if unmaterialized:
+        raise TypeError(
+            "materialize_multimodal_data returned unmaterialized PackedTensor "
+            f"values for keys {sorted(unmaterialized)}"
+        )
+    return filter_multimodal_kwargs_for_model(model, materialized)
 
 
 @dataclass
@@ -312,8 +394,10 @@ def process_microbatch(
         )
         flash_attn_kwargs = {}
 
-    # Add vlm kwargs to model call
-    vlm_kwargs = mb.get_multimodal_dict(as_tensors=True, device=input_ids.device)
+    # Preserve logical multimodal rows until the concrete model is available.
+    # A model-owned materializer may need to jointly flatten variable-length
+    # features and rebase their per-row indices immediately before forward.
+    vlm_kwargs = mb.get_multimodal_dict(as_tensors=False)
     if len(vlm_kwargs) > 0:
         # if there are multimodal kwargs, we don't need to add position_ids (computed internally)
         position_ids = None

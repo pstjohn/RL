@@ -26,6 +26,7 @@ except ImportError:
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossInputType
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.automodel.data import (
     ProcessedInputs,
@@ -180,6 +181,100 @@ class TestModelForward:
         assert "pixel_values" in call_kwargs
         # Flash attention should be removed for multimodal
         assert "flash_attn_kwargs" not in call_kwargs
+
+    def test_forward_uses_default_packed_tensor_materialization(self):
+        class DefaultMultimodalModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.pixel_values = None
+
+            def forward(self, **kwargs):
+                self.pixel_values = kwargs["pixel_values"]
+                return MagicMock(logits=torch.randn(2, 64, 1000))
+
+        model = DefaultMultimodalModel()
+        processed_inputs = ProcessedInputs(
+            input_ids=torch.randint(0, 1000, (2, 64)),
+            seq_len=64,
+            attention_mask=torch.ones(2, 64, dtype=torch.bool),
+            position_ids=None,
+            vlm_kwargs={
+                "pixel_values": PackedTensor(
+                    [torch.randn(1, 3, 8, 8), torch.randn(1, 3, 8, 8)],
+                    dim_to_pack=0,
+                )
+            },
+        )
+
+        model_forward(model, processed_inputs)
+
+        assert isinstance(model.pixel_values, torch.Tensor)
+        assert model.pixel_values.shape == (2, 3, 8, 8)
+
+    def test_forward_model_materializer_flattens_ragged_rows_and_rebases_indices(
+        self,
+    ):
+        class RaggedPayloadModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.forward_kwargs = {}
+
+            def materialize_multimodal_data(self, multimodal_data, *, input_ids):
+                feature_rows = []
+                index_rows = []
+                features = multimodal_data["mm_features__rna"]
+                indices = multimodal_data["mm_token_indices__rna"]
+                assert isinstance(features, PackedTensor)
+                assert isinstance(indices, PackedTensor)
+                for row in range(len(features)):
+                    feature_row = features.slice([row]).as_tensor(
+                        device=input_ids.device
+                    )
+                    index_row = indices.slice([row]).as_tensor(device=input_ids.device)
+                    assert feature_row is not None
+                    assert index_row is not None
+                    feature_rows.append(feature_row.squeeze(0))
+                    index_rows.append(index_row.squeeze(0) + row * input_ids.shape[1])
+                return {
+                    "mm_features__rna": torch.cat(feature_rows),
+                    "mm_token_indices__rna": torch.cat(index_rows),
+                }
+
+            def forward(self, **kwargs):
+                self.forward_kwargs = kwargs
+                return MagicMock(logits=torch.randn(2, 256, 1000))
+
+        model = RaggedPayloadModel()
+        features = PackedTensor(
+            [torch.randn(1, 50, 4), torch.randn(1, 240, 4)],
+            dim_to_pack=0,
+        )
+        indices = PackedTensor(
+            [torch.arange(50).unsqueeze(0), torch.arange(240).unsqueeze(0)],
+            dim_to_pack=0,
+        )
+        processed_inputs = ProcessedInputs(
+            input_ids=torch.randint(0, 1000, (2, 256)),
+            seq_len=256,
+            attention_mask=torch.ones(2, 256, dtype=torch.bool),
+            position_ids=None,
+            vlm_kwargs={
+                "mm_features__rna": features,
+                "mm_token_indices__rna": indices,
+            },
+        )
+
+        model_forward(model, processed_inputs)
+
+        assert model.forward_kwargs["mm_features__rna"].shape == (290, 4)
+        expected_indices = torch.cat([torch.arange(50), torch.arange(240) + 256])
+        torch.testing.assert_close(
+            model.forward_kwargs["mm_token_indices__rna"], expected_indices
+        )
+        assert [tuple(row.shape) for row in features.tensors] == [
+            (1, 50, 4),
+            (1, 240, 4),
+        ]
 
     def test_forward_filters_unsupported_multimodal_metadata(
         self, processed_inputs_multimodal

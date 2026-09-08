@@ -413,15 +413,39 @@ class TestProcessMicrobatch:
         # Verify multimodal kwargs were extracted
         assert isinstance(result, ProcessedInputs)
         assert "pixel_values" in result.vlm_kwargs
-        assert result.vlm_kwargs["pixel_values"].shape == (2, 3, 224, 224)
-        torch.testing.assert_close(
-            result.vlm_kwargs["pixel_values"][0],
-            result.vlm_kwargs["pixel_values"][1],
-            rtol=0,
-            atol=0,
-        )
+        assert isinstance(result.vlm_kwargs["pixel_values"], PackedTensor)
+        assert len(result.vlm_kwargs["pixel_values"]) == 2
+        assert len(result.vlm_kwargs["pixel_values"].tensors) == 1
         # When multimodal inputs are present, position_ids should be None
         assert result.position_ids is None
+
+    def test_ragged_multimodal_rows_are_not_materialized_while_batching(
+        self, mock_tokenizer
+    ):
+        features = PackedTensor(
+            [torch.randn(1, 50, 4), torch.randn(1, 240, 4)],
+            dim_to_pack=0,
+        )
+        mb = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (2, 256)),
+                "mm_features__rna": features,
+            }
+        )
+
+        result = process_microbatch(
+            mb=mb,
+            tokenizer=mock_tokenizer,
+            enable_seq_packing=False,
+            cfg={"dtensor_cfg": {"sequence_parallel": False}},
+            cp_size=1,
+        )
+
+        assert result.vlm_kwargs["mm_features__rna"] is features
+        assert [tuple(row.shape) for row in features.tensors] == [
+            (1, 50, 4),
+            (1, 240, 4),
+        ]
 
     def test_with_context_parallel(self, mock_tokenizer):
         # Create test microbatch

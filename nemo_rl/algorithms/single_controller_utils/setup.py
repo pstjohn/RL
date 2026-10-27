@@ -1247,10 +1247,14 @@ def setup_single_controller(
             "single_controller_utils does not support "
             "data.use_multiple_dataloader=True yet."
         )
-    if opd_module.is_opd_enabled(master_config) and processor is not None:
-        raise NotImplementedError(
-            "SingleController MOPD currently supports text-only teacher inputs. "
-            "Use the legacy controller for multimodal MOPD."
+    if (
+        opd_module.is_opd_enabled(master_config)
+        and processor is not None
+        and not master_config.token_capture.enabled
+    ):
+        raise ValueError(
+            "SingleController multimodal MOPD requires token_capture.enabled=true "
+            "to reuse the rollout's captured media for teacher scoring."
         )
 
     checkpointing_pretrained = master_config.checkpointing.get("pretrained_checkpoint")
@@ -1276,6 +1280,15 @@ def setup_single_controller(
     # nemo_rl/distributed/actor_environments.py), so nothing here needs to
     # change the worker's environment.
     token_capture_cfg = master_config.token_capture
+    if (
+        generation_config["backend"] == "megatron"
+        and router_replay_enabled(master_config.policy)
+        and not token_capture_cfg.enabled
+    ):
+        raise ValueError(
+            "Megatron router replay requires token_capture.enabled=true so "
+            "MInf routing indices can be joined with Gym lineage"
+        )
     capture_media = token_capture_cfg.enabled and processor is not None
     if capture_media:
         if not uses_image_placeholder(processor):
@@ -1359,10 +1372,14 @@ def setup_single_controller(
                     "Megatron token capture requires policy.generation."
                     "mcore_generation_config.expose_http_server=true"
                 )
-            if router_replay_enabled(master_config.policy):
+            if (
+                router_replay_enabled(master_config.policy)
+                and token_capture_cfg.defer_routed_experts_to_policy
+            ):
                 raise NotImplementedError(
-                    "Megatron token capture does not yet support router replay: "
-                    "the canonical MInf stager does not yet normalize routed experts"
+                    "Megatron token capture does not support "
+                    "token_capture.defer_routed_experts_to_policy yet; MInf "
+                    "routing indices are aligned in the canonical stager"
                 )
 
         # Fill the derived ledger-hosting fields (see TokenCaptureConfig): a
